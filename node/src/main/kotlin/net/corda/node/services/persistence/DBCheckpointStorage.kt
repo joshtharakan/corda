@@ -48,6 +48,7 @@ class DBCheckpointStorage : CheckpointStorage {
     }
 
     override fun updateCheckpoint(id: StateMachineRunId, checkpoint: SerializedBytes<Checkpoint>) {
+//        log.info("Checkpoint size: ${id.uuid} ${checkpoint.size} bytes")
         currentDBSession().update(DBCheckpoint().apply {
             checkpointId = id.uuid.toString()
             this.checkpoint = checkpoint.bytes

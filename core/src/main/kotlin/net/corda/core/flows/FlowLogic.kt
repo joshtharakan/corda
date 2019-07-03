@@ -317,7 +317,10 @@ abstract class FlowLogic<out T> {
         subLogic.stateMachine = stateMachine
         maybeWireUpProgressTracking(subLogic)
         logger.debug { "Calling subflow: $subLogic" }
+        val start = System.currentTimeMillis()
         val result = stateMachine.subFlow(subLogic)
+        val end = System.currentTimeMillis()
+        logger.info("subFlow: ${subLogic.javaClass.name} ${end-start}ms")
         logger.debug { "Subflow finished with result ${result.toString().abbreviate(300)}" }
         return result
     }
