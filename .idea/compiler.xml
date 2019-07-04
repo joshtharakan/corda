@@ -183,6 +183,8 @@
       <module name="netparams_test" target="1.8" />
       <module name="network-bootstrapper_main" target="1.8" />
       <module name="network-bootstrapper_test" target="1.8" />
+      <module name="network-builder_main" target="1.8" />
+      <module name="network-builder_test" target="1.8" />
       <module name="network-verifier-contracts_main" target="1.8" />
       <module name="network-verifier-contracts_test" target="1.8" />
       <module name="network-verifier-workflows_main" target="1.8" />

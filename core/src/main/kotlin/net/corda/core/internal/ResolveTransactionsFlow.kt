@@ -2,22 +2,17 @@ package net.corda.core.internal
 
 import co.paralleluniverse.fibers.Suspendable
 import net.corda.core.DeleteForDJVM
-import net.corda.core.contracts.TransactionResolutionException
-import net.corda.core.contracts.TransactionVerificationException
 import net.corda.core.crypto.SecureHash
 import net.corda.core.flows.FlowException
 import net.corda.core.flows.FlowLogic
 import net.corda.core.flows.FlowSession
-import net.corda.core.node.ServiceHub
 import net.corda.core.node.StatesToRecord
-import net.corda.core.serialization.CordaSerializable
 import net.corda.core.transactions.ContractUpgradeWireTransaction
 import net.corda.core.transactions.SignedTransaction
 import net.corda.core.transactions.WireTransaction
 import net.corda.core.utilities.exactAdd
 import java.util.*
-import kotlin.collections.ArrayList
-import kotlin.math.min
+import kotlin.collections.LinkedHashSet
 
 // TODO: This code is currently unit tested by TwoPartyTradeFlowTests, it should have its own tests.
 /**
@@ -25,14 +20,15 @@ import kotlin.math.min
  * Each retrieved transaction is validated and inserted into the local transaction storage.
  */
 @DeleteForDJVM
-class ResolveTransactionsFlow(txHashesArg: Set<SecureHash>,
-                              private val otherSide: FlowSession,
-                              private val statesToRecord: StatesToRecord = StatesToRecord.NONE) : FlowLogic<Unit>() {
+class ResolveTransactionsFlow private constructor(
+        private val initialTx: SignedTransaction?,
+        private val txHashes: Set<SecureHash>,
+        private val otherSide: FlowSession,
+        private val statesToRecord: StatesToRecord
+) : FlowLogic<Unit>() {
 
-    // Need it ordered in terms of iteration. Needs to be a variable for the check-pointing logic to work.
-    private val txHashes = txHashesArg.toList()
-    /** Transaction to fetch attachments for. */
-    private var signedTransaction: SignedTransaction? = null
+    constructor(txHashes: Set<SecureHash>, otherSide: FlowSession, statesToRecord: StatesToRecord = StatesToRecord.NONE)
+            : this(null, txHashes, otherSide, statesToRecord)
 
     /**
      * Resolves and validates the dependencies of the specified [SignedTransaction]. Fetches the attachments, but does
@@ -40,19 +36,13 @@ class ResolveTransactionsFlow(txHashesArg: Set<SecureHash>,
      *
      * @return a list of verified [SignedTransaction] objects, in a depth-first order.
      */
-    constructor(signedTransaction: SignedTransaction, otherSide: FlowSession) : this(dependencyIDs(signedTransaction), otherSide) {
-        this.signedTransaction = signedTransaction
-    }
-
-    constructor(signedTransaction: SignedTransaction, otherSide: FlowSession, statesToRecord: StatesToRecord) : this(dependencyIDs(signedTransaction), otherSide, statesToRecord) {
-        this.signedTransaction = signedTransaction
-    }
+    constructor(initialTransaction: SignedTransaction, otherSide: FlowSession, statesToRecord: StatesToRecord = StatesToRecord.NONE)
+            : this(initialTransaction, initialTransaction.dependencies, otherSide, statesToRecord)
 
     @DeleteForDJVM
     companion object {
-        private fun dependencyIDs(stx: SignedTransaction) = stx.inputs.map { it.txhash }.toSet() + stx.references.map { it.txhash }.toSet()
-
-        private const val RESOLUTION_PAGE_SIZE = 100
+        private val SignedTransaction.dependencies: Set<SecureHash>
+            get() = (inputs.asSequence() + references.asSequence()).map { it.txhash }.toSet()
 
         /** Topologically sorts the given transactions such that dependencies are listed before dependers. */
         @JvmStatic
@@ -65,35 +55,19 @@ class ResolveTransactionsFlow(txHashesArg: Set<SecureHash>,
         }
     }
     
-    class ExcessivelyLargeTransactionGraph : FlowException()
-
-    // TODO: Figure out a more appropriate DOS limit here, 5000 is simply a very bad guess.
-    /** The maximum number of transactions this flow will try to download before bailing out. */
-    var transactionCountLimit = 5000
-        set(value) {
-            require(value > 0) { "$value is not a valid count limit" }
-            field = value
-        }
-
     @Suspendable
-    @Throws(FetchDataFlow.HashNotFound::class, FetchDataFlow.IllegalTransactionRequest::class)
     override fun call() {
+        val start = System.currentTimeMillis()
         val counterpartyPlatformVersion = serviceHub.networkMapCache.getNodeByLegalIdentity(otherSide.counterparty)?.platformVersion
                 ?: throw FlowException("Couldn't retrieve party's ${otherSide.counterparty} platform version from NetworkMapCache")
-        val newTxns = ArrayList<SignedTransaction>(txHashes.size)
-        // Start fetching data.
-        for (pageNumber in 0..(txHashes.size - 1) / RESOLUTION_PAGE_SIZE) {
-            val page = page(pageNumber, RESOLUTION_PAGE_SIZE)
 
-            newTxns += downloadDependencies(page)
-            val txsWithMissingAttachments = if (pageNumber == 0) signedTransaction?.let { newTxns + it }
-                    ?: newTxns else newTxns
-            fetchMissingAttachments(txsWithMissingAttachments)
-            // Fetch missing parameters flow was added in version 4. This check is needed so we don't end up with node V4 sending parameters
-            // request to node V3 that doesn't know about this protocol.
-            if (counterpartyPlatformVersion >= 4) {
-                fetchMissingParameters(txsWithMissingAttachments)
-            }
+        val newTxns = downloadDependencies()
+        val newTxnsPlusInitial = initialTx?.let { newTxns + it } ?: newTxns
+        fetchMissingAttachments(newTxnsPlusInitial)
+        // Fetch missing parameters flow was added in version 4. This check is needed so we don't end up with node V4 sending parameters
+        // request to node V3 that doesn't know about this protocol.
+        if (counterpartyPlatformVersion >= 4) {
+            fetchMissingParameters(newTxnsPlusInitial)
         }
         otherSide.send(FetchDataFlow.Request.End)
         // Finish fetching data.
@@ -110,18 +84,12 @@ class ResolveTransactionsFlow(txHashesArg: Set<SecureHash>,
             it.verify(serviceHub)
             serviceHub.recordTransactions(usedStatesToRecord, listOf(it))
         }
-    }
-
-    private fun page(pageNumber: Int, pageSize: Int): Set<SecureHash> {
-        val offset = pageNumber * pageSize
-        val limit = min(offset + pageSize, txHashes.size)
-        // call toSet() is needed because sub-lists are not checkpoint-friendly.
-        return txHashes.subList(offset, limit).toSet()
+        val end = System.currentTimeMillis()
+        logger.info("Resolving ${result.size} backchain from ${otherSide.destination} took ${(end-start)/1000}secs")
     }
 
     @Suspendable
-    // TODO use paging here (we literally get the entire dependencies graph in memory)
-    private fun downloadDependencies(depsToCheck: Set<SecureHash>): List<SignedTransaction> {
+    private fun downloadDependencies(): List<SignedTransaction> {
         // Maintain a work queue of all hashes to load/download, initialised with our starting set. Then do a breadth
         // first traversal across the dependency graph.
         //
@@ -139,10 +107,9 @@ class ResolveTransactionsFlow(txHashesArg: Set<SecureHash>,
         // accept this kind of change is possible? Most likely solution is for identity data to be an attachment.
 
         val nextRequests = LinkedHashSet<SecureHash>()   // Keep things unique but ordered, for unit test stability.
-        nextRequests.addAll(depsToCheck)
+        nextRequests.addAll(txHashes)
         val resultQ = LinkedHashMap<SecureHash, SignedTransaction>()
 
-        val limit = transactionCountLimit
         var limitCounter = 0
         while (nextRequests.isNotEmpty()) {
             // Don't re-download the same tx when we haven't verified it yet but it's referenced multiple times in the
@@ -150,24 +117,23 @@ class ResolveTransactionsFlow(txHashesArg: Set<SecureHash>,
             val notAlreadyFetched: Set<SecureHash> = nextRequests - resultQ.keys
             nextRequests.clear()
 
-            if (notAlreadyFetched.isEmpty())   // Done early.
+            if (notAlreadyFetched.isEmpty()) {
+                // Done early.
                 break
+            }
 
             // Request the standalone transaction data (which may refer to things we don't yet have).
-            // TODO use paging here
+
             val downloads: List<SignedTransaction> = subFlow(FetchTransactionsFlow(notAlreadyFetched, otherSide)).downloaded
 
-            for (stx in downloads)
+            for (stx in downloads) {
                 check(resultQ.putIfAbsent(stx.id, stx) == null)   // Assert checks the filter at the start.
-
-            // Add all input states and reference input states to the work queue.
-            val inputHashes = downloads.flatMap { it.inputs + it.references }.map { it.txhash }
-
-            nextRequests.addAll(inputHashes)
+                // Add all input states and reference input states to the work queue.
+                nextRequests.addAll(stx.dependencies)
+            }
 
             limitCounter = limitCounter exactAdd nextRequests.size
-            if (limitCounter > limit)
-                throw ExcessivelyLargeTransactionGraph()
+            logger.info("So far backchain to resolve is $limitCounter")
         }
         return resultQ.values.toList()
     }
@@ -187,16 +153,18 @@ class ResolveTransactionsFlow(txHashesArg: Set<SecureHash>,
             }
         }
         val missingAttachments = attachments.filter { serviceHub.attachments.openAttachment(it) == null }
-        if (missingAttachments.isNotEmpty())
+        if (missingAttachments.isNotEmpty()) {
             subFlow(FetchAttachmentsFlow(missingAttachments.toSet(), otherSide))
+        }
     }
 
     // TODO This can also be done in parallel. See comment to [fetchMissingAttachments] above.
     @Suspendable
     private fun fetchMissingParameters(downloads: List<SignedTransaction>) {
-        val parameters = downloads.mapNotNull { it.networkParametersHash }
-        val missingParameters = parameters.filter { !(serviceHub.networkParametersService as NetworkParametersStorage).hasParameters(it) }
-        if (missingParameters.isNotEmpty())
+        val networkParametersStorage = serviceHub.networkParametersService as NetworkParametersStorage
+        val missingParameters = downloads.mapNotNull { it.networkParametersHash }.filterNot(networkParametersStorage::hasParameters)
+        if (missingParameters.isNotEmpty()) {
             subFlow(FetchNetworkParametersFlow(missingParameters.toSet(), otherSide))
+        }
     }
 }
