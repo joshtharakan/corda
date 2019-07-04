@@ -16,13 +16,10 @@ import net.corda.core.node.services.KeyManagementService
 import net.corda.core.serialization.SerializationContext
 import net.corda.core.serialization.SerializationFactory
 import net.corda.core.utilities.contextLogger
-import java.io.NotSerializableException
-import java.lang.Exception
 import java.security.PublicKey
 import java.time.Duration
 import java.time.Instant
-import java.util.ArrayDeque
-import java.util.UUID
+import java.util.*
 import java.util.regex.Pattern
 import kotlin.collections.ArrayList
 import kotlin.collections.component1
@@ -273,7 +270,7 @@ open class TransactionBuilder(
         val refStateContractAttachments: List<AttachmentId> = referenceStateGroups
                 .filterNot { it.key in allContracts }
                 .map { refStateEntry ->
-                    selectAttachmentThatSatisfiesConstraints(true, refStateEntry.key, refStateEntry.value, emptySet(), services)
+                    selectAttachmentThatSatisfiesConstraints(refStateEntry.key, refStateEntry.value, services)
                 }
 
         val contractClassNameToInputStateRef: Map<ContractClassName, Set<StateRef>> = inputsWithTransactionState.map { Pair(it.state.contract, it.ref) }
@@ -282,7 +279,7 @@ open class TransactionBuilder(
         // For each contract, resolve the AutomaticPlaceholderConstraint, and select the attachment.
         val contractAttachmentsAndResolvedOutputStates: List<Pair<AttachmentId, List<TransactionState<ContractState>>?>> = allContracts.toSet()
                 .map { ctr ->
-                    handleContract(ctr, inputContractGroups[ctr], contractClassNameToInputStateRef[ctr], outputContractGroups[ctr], explicitAttachmentContractsMap[ctr], services)
+                    handleContract(ctr, inputContractGroups[ctr], outputContractGroups[ctr], explicitAttachmentContractsMap[ctr], services)
                 }
 
         val resolvedStates: List<TransactionState<ContractState>> = contractAttachmentsAndResolvedOutputStates.mapNotNull { it.second }
@@ -316,60 +313,45 @@ open class TransactionBuilder(
     private fun handleContract(
             contractClassName: ContractClassName,
             inputStates: List<TransactionState<ContractState>>?,
-            inputStateRefs: Set<StateRef>?,
             outputStates: List<TransactionState<ContractState>>?,
             explicitContractAttachment: AttachmentId?,
             services: ServicesForResolution
     ): Pair<AttachmentId, List<TransactionState<ContractState>>?> {
         val inputsAndOutputs = (inputStates ?: emptyList()) + (outputStates ?: emptyList())
 
-        // Determine if there are any HashConstraints that pin the version of a contract. If there are, check if we trust them.
-        val hashAttachments = inputsAndOutputs
-                .filter { it.constraint is HashAttachmentConstraint }
-                .map { state ->
-                    val attachment = services.attachments.openAttachment((state.constraint as HashAttachmentConstraint).attachmentId)
-                    if (attachment == null || attachment !is ContractAttachment || !isUploaderTrusted(attachment.uploader)) {
-                        // This should never happen because these are input states that should have been validated already.
-                        throw MissingContractAttachments(listOf(state))
-                    }
-                    attachment
-                }.toSet()
+        // Determine if there are any HashConstraints that pin the version of a contract.
+        val hashAttachmentIds = inputsAndOutputs
+                .filter { it.constraint is HashAttachmentConstraint }.map { (it.constraint as HashAttachmentConstraint).attachmentId }.toSet()
 
         // Check that states with the HashConstraint don't conflict between themselves or with an explicitly set attachment.
-        require(hashAttachments.size <= 1) {
+        require(hashAttachmentIds.size <= 1) {
             "Transaction was built with $contractClassName states with multiple HashConstraints. This is illegal, because it makes it impossible to validate with a single version of the contract code."
         }
 
-        if (explicitContractAttachment != null && hashAttachments.singleOrNull() != null) {
-            require(explicitContractAttachment == (hashAttachments.single() as ContractAttachment).attachment.id) {
+        val hashAttachmentId = hashAttachmentIds.singleOrNull()
+
+        if (explicitContractAttachment != null && hashAttachmentId != null) {
+            require(explicitContractAttachment == hashAttachmentId) {
                 "An attachment has been explicitly set for contract $contractClassName in the transaction builder which conflicts with the HashConstraint of a state."
             }
         }
 
-        // This will contain the hash of the JAR that *has* to be used by this Transaction, because it is explicit. Or null if none.
-        val forcedAttachmentId = explicitContractAttachment ?: hashAttachments.singleOrNull()?.id
-
-        fun selectAttachment() = selectAttachmentThatSatisfiesConstraints(
-                false,
+        val attachmentToUse = selectContractAttachment(
+                hashAttachmentId,
                 contractClassName,
-                inputsAndOutputs.filterNot { it.constraint in automaticConstraints },
-                inputStateRefs,
-                services)
-
-        // This will contain the hash of the JAR that will be used by this Transaction.
-        val selectedAttachmentId = forcedAttachmentId ?: selectAttachment()
-
-        val attachmentToUse = services.attachments.openAttachment(selectedAttachmentId)?.let { it as ContractAttachment }
-                ?: throw IllegalArgumentException("Contract attachment $selectedAttachmentId for $contractClassName is missing.")
+                inputsAndOutputs,
+                explicitContractAttachment,
+                services
+        )
 
         // For Exit transactions (no output states) there is no need to resolve the output constraints.
         if (outputStates == null) {
-            return Pair(selectedAttachmentId, null)
+            return Pair(attachmentToUse.id, null)
         }
 
         // If there are no automatic constraints, there is nothing to resolve.
         if (outputStates.none { it.constraint in automaticConstraints }) {
-            return Pair(selectedAttachmentId, outputStates)
+            return Pair(attachmentToUse.id, outputStates)
         }
 
         // The final step is to resolve AutomaticPlaceholderConstraint.
@@ -383,7 +365,8 @@ open class TransactionBuilder(
 
         // Sanity check that the selected attachment actually passes.
         val constraintAttachment = AttachmentWithContext(attachmentToUse, contractClassName, services.networkParameters.whitelistedContractImplementations)
-        require(defaultOutputConstraint.isSatisfiedBy(constraintAttachment)) { "Selected output constraint: $defaultOutputConstraint not satisfying $selectedAttachmentId" }
+
+        require(defaultOutputConstraint.isSatisfiedBy(constraintAttachment)) { "Selected output constraint: $defaultOutputConstraint not satisfying ${attachmentToUse.id}" }
 
         val resolvedOutputStates = outputStates.map {
             val outputConstraint = it.constraint
@@ -399,7 +382,42 @@ open class TransactionBuilder(
             }
         }
 
-        return Pair(selectedAttachmentId, resolvedOutputStates)
+        return Pair(attachmentToUse.id, resolvedOutputStates)
+    }
+
+    private fun selectContractAttachment(
+            hashAttachmentId: AttachmentId?,
+            contractClassName: ContractClassName,
+            inputsAndOutputs: List<TransactionState<ContractState>>,
+            explicitContractAttachment: AttachmentId?,
+            services: ServicesForResolution
+    ): ContractAttachment {
+
+        fun selectAttachment() = selectAttachmentThatSatisfiesConstraints(
+                contractClassName,
+                inputsAndOutputs.filterNot { it.constraint in automaticConstraints },
+                services
+        )
+
+        val selectedAttachmentId = explicitContractAttachment ?: selectAttachment()
+
+        val attachmentFromCordappProvider = services.attachments.openAttachment(selectedAttachmentId)?.let { it as ContractAttachment }
+                ?: throw IllegalArgumentException("Contract attachment $selectedAttachmentId for $contractClassName is missing.")
+
+        // Determine whether to use the retrieved contract attachment or retrieve the attachment related to the hash constraint
+        return if (hashAttachmentId == null
+                || attachmentFromCordappProvider.id == hashAttachmentId
+                || (HashAttachmentConstraint.disableHashConstraints && attachmentFromCordappProvider.isSigned)) {
+            attachmentFromCordappProvider
+        } else {
+            // Get attachment that the hash constraint references from the vault
+            val attachment = services.attachments.openAttachment(hashAttachmentId)
+            if (attachment == null || attachment !is ContractAttachment || !isUploaderTrusted(attachment.uploader)) {
+                // This should never happen because the attachmentId is retrieved from input states that should have been validated already
+                throw MissingContractAttachments(emptyList(), contractClassName)
+            }
+            attachment
+        }
     }
 
     /**
@@ -452,8 +470,20 @@ open class TransactionBuilder(
             throw IllegalArgumentException("Cannot mix HashConstraints with different hashes in the same transaction.")
 
         // The HashAttachmentConstraint is the strongest constraint, so it wins when mixed with anything. As long as the actual constraints pass.
-        // TODO - this could change if we decide to introduce a way to gracefully migrate from the Hash Constraint to the Signature Constraint.
-        constraints.any { it is HashAttachmentConstraint } -> constraints.find { it is HashAttachmentConstraint }!!
+        constraints.any { it is HashAttachmentConstraint } -> {
+            when {
+                // Migration from a Hash Constraint to a Signature Constraint
+                attachmentToUse.isSigned -> {
+                    val signatureConstraint = constraints.singleOrNull { it is SignatureAttachmentConstraint }
+                    // If there were states transitioned already used in the current transaction use that signature constraint, otherwise create a new one.
+                    when {
+                        signatureConstraint != null -> signatureConstraint
+                        else -> makeSignatureAttachmentConstraint(attachmentToUse.signerKeys)
+                    }
+                }
+                else -> constraints.single { it is HashAttachmentConstraint }
+            }
+        }
 
         // TODO, we don't currently support mixing signature constraints with different signers. This will change once we introduce third party signers.
         constraints.count { it is SignatureAttachmentConstraint } > 1 ->
@@ -485,10 +515,9 @@ open class TransactionBuilder(
     /**
      * This method should only be called for upgradeable contracts.
      */
-    private fun selectAttachmentThatSatisfiesConstraints(isReference: Boolean, contractClassName: String, states: List<TransactionState<ContractState>>, stateRefs: Set<StateRef>?, services: ServicesForResolution): AttachmentId {
+    private fun selectAttachmentThatSatisfiesConstraints(contractClassName: String, states: List<TransactionState<ContractState>>, services: ServicesForResolution): AttachmentId {
         val constraints = states.map { it.constraint }
         require(constraints.none { it in automaticConstraints })
-        require(isReference || constraints.none { it is HashAttachmentConstraint })
 
         return services.cordappProvider.getContractAttachmentID(contractClassName)
                 ?: throw MissingContractAttachments(states, contractClassName)
