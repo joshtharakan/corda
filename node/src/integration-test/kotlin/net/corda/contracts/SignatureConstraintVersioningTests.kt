@@ -101,8 +101,13 @@ class SignatureConstraintVersioningTests {
     @Test
     fun `auto migration from WhitelistConstraint to SignatureConstraint`() {
         assumeFalse(System.getProperty("os.name").toLowerCase().startsWith("win")) // See NodeStatePersistenceTests.kt.
-        val (issuanceTransaction, consumingTransaction) =
-                upgradeCorDappBetweenTransactions(oldUnsignedCordapp, newCordapp, mapOf(TEST_MESSAGE_CONTRACT_PROGRAM_ID to listOf(oldUnsignedCordapp, newCordapp)), emptyMap(), false)
+        val (issuanceTransaction, consumingTransaction) = upgradeCorDappBetweenTransactions(
+                cordapp = oldUnsignedCordapp,
+                newCordapp = newCordapp,
+                whiteListedCordapps = mapOf(TEST_MESSAGE_CONTRACT_PROGRAM_ID to listOf(oldUnsignedCordapp, newCordapp)),
+                systemProperties = emptyMap(),
+                startNodesInProcess = false
+        )
         assertEquals(1, issuanceTransaction.outputs.size)
         assertTrue(issuanceTransaction.outputs.single().constraint is WhitelistedByZoneAttachmentConstraint)
         assertEquals(1, consumingTransaction.outputs.size)
@@ -110,18 +115,46 @@ class SignatureConstraintVersioningTests {
     }
 
     @Test
+    fun `WhitelistConstraint cannot be migrated to SignatureConstraint if platform version is not 4 or greater`() {
+        assumeFalse(System.getProperty("os.name").toLowerCase().startsWith("win")) // See NodeStatePersistenceTests.kt.
+        val (issuanceTransaction, consumingTransaction) = upgradeCorDappBetweenTransactions(
+                cordapp = oldUnsignedCordapp,
+                newCordapp = newCordapp,
+                whiteListedCordapps = mapOf(TEST_MESSAGE_CONTRACT_PROGRAM_ID to listOf(oldUnsignedCordapp, newCordapp)),
+                systemProperties = emptyMap(),
+                startNodesInProcess = false,
+                minimumPlatformVersion = 3
+        )
+        assertEquals(1, issuanceTransaction.outputs.size)
+        assertTrue(issuanceTransaction.outputs.single().constraint is WhitelistedByZoneAttachmentConstraint)
+        assertEquals(1, consumingTransaction.outputs.size)
+        assertTrue(consumingTransaction.outputs.single().constraint is WhitelistedByZoneAttachmentConstraint)
+    }
+
+    @Test
     fun `auto migration from WhitelistConstraint to SignatureConstraint fail for not whitelisted signed JAR`() {
         assumeFalse(System.getProperty("os.name").toLowerCase().startsWith("win")) // See NodeStatePersistenceTests.kt.
         assertThatExceptionOfType(CordaRuntimeException::class.java).isThrownBy {
-            upgradeCorDappBetweenTransactions(oldUnsignedCordapp, newCordapp, mapOf(TEST_MESSAGE_CONTRACT_PROGRAM_ID to emptyList()), emptyMap(), true)
+            upgradeCorDappBetweenTransactions(
+                    cordapp = oldUnsignedCordapp,
+                    newCordapp = newCordapp,
+                    whiteListedCordapps = mapOf(TEST_MESSAGE_CONTRACT_PROGRAM_ID to emptyList()),
+                    systemProperties = emptyMap(),
+                    startNodesInProcess = true
+            )
         }.withMessageContaining("Selected output constraint: $WhitelistedByZoneAttachmentConstraint not satisfying")
     }
 
     @Test
     fun `auto migration from HashConstraint to SignatureConstraint`() {
         assumeFalse(System.getProperty("os.name").toLowerCase().startsWith("win")) // See NodeStatePersistenceTests.kt.
-        val (issuanceTransaction, consumingTransaction) =
-                upgradeCorDappBetweenTransactions(oldUnsignedCordapp, newCordapp, emptyMap(), mapOf("net.corda.node.disableHashConstraints" to true.toString()), false)
+        val (issuanceTransaction, consumingTransaction) = upgradeCorDappBetweenTransactions(
+                cordapp = oldUnsignedCordapp,
+                newCordapp = newCordapp,
+                whiteListedCordapps = emptyMap(),
+                systemProperties = mapOf("net.corda.node.disableHashConstraints" to true.toString()),
+                startNodesInProcess = false
+        )
         assertEquals(1, issuanceTransaction.outputs.size)
         assertTrue(issuanceTransaction.outputs.single().constraint is HashAttachmentConstraint)
         assertEquals(1, consumingTransaction.outputs.size)
@@ -131,8 +164,13 @@ class SignatureConstraintVersioningTests {
     @Test
     fun `HashConstraint cannot be migrated if 'disableHashConstraints' system property is not set to true`() {
         assumeFalse(System.getProperty("os.name").toLowerCase().startsWith("win")) // See NodeStatePersistenceTests.kt.
-        val (issuanceTransaction, consumingTransaction) =
-                upgradeCorDappBetweenTransactions(oldUnsignedCordapp, newCordapp, emptyMap(), emptyMap(), false)
+        val (issuanceTransaction, consumingTransaction) = upgradeCorDappBetweenTransactions(
+                cordapp = oldUnsignedCordapp,
+                newCordapp = newCordapp,
+                whiteListedCordapps = emptyMap(),
+                systemProperties = emptyMap(),
+                startNodesInProcess = false
+        )
         assertEquals(1, issuanceTransaction.outputs.size)
         assertTrue(issuanceTransaction.outputs.single().constraint is HashAttachmentConstraint)
         assertEquals(1, consumingTransaction.outputs.size)
@@ -142,8 +180,30 @@ class SignatureConstraintVersioningTests {
     @Test
     fun `HashConstraint cannot be migrated to SignatureConstraint if new jar is not signed`() {
         assumeFalse(System.getProperty("os.name").toLowerCase().startsWith("win")) // See NodeStatePersistenceTests.kt.
-        val (issuanceTransaction, consumingTransaction) =
-                upgradeCorDappBetweenTransactions(oldUnsignedCordapp, newUnsignedCordapp, emptyMap(), mapOf("net.corda.node.disableHashConstraints" to true.toString()), false)
+        val (issuanceTransaction, consumingTransaction) = upgradeCorDappBetweenTransactions(
+                cordapp = oldUnsignedCordapp,
+                newCordapp = newUnsignedCordapp,
+                whiteListedCordapps = emptyMap(),
+                systemProperties = mapOf("net.corda.node.disableHashConstraints" to true.toString()),
+                startNodesInProcess = false
+        )
+        assertEquals(1, issuanceTransaction.outputs.size)
+        assertTrue(issuanceTransaction.outputs.single().constraint is HashAttachmentConstraint)
+        assertEquals(1, consumingTransaction.outputs.size)
+        assertTrue(consumingTransaction.outputs.single().constraint is HashAttachmentConstraint)
+    }
+
+    @Test
+    fun `HashConstraint cannot be migrated to SignatureConstraint if platform version is not 4 or greater`() {
+        assumeFalse(System.getProperty("os.name").toLowerCase().startsWith("win")) // See NodeStatePersistenceTests.kt.
+        val (issuanceTransaction, consumingTransaction) = upgradeCorDappBetweenTransactions(
+                cordapp = oldUnsignedCordapp,
+                newCordapp = newUnsignedCordapp,
+                whiteListedCordapps = emptyMap(),
+                systemProperties = mapOf("net.corda.node.disableHashConstraints" to true.toString()),
+                startNodesInProcess = false,
+                minimumPlatformVersion = 3
+        )
         assertEquals(1, issuanceTransaction.outputs.size)
         assertTrue(issuanceTransaction.outputs.single().constraint is HashAttachmentConstraint)
         assertEquals(1, consumingTransaction.outputs.size)
@@ -159,7 +219,8 @@ class SignatureConstraintVersioningTests {
             newCordapp: CustomCordapp,
             whiteListedCordapps: Map<ContractClassName, List<CustomCordapp>>,
             systemProperties: Map<String, String>,
-            startNodesInProcess: Boolean
+            startNodesInProcess: Boolean,
+            minimumPlatformVersion: Int = 4
     ): Pair<CoreTransaction, CoreTransaction> {
 
         val whitelistedAttachmentHashes = whiteListedCordapps.mapValues { (_, cordapps) ->
@@ -173,8 +234,10 @@ class SignatureConstraintVersioningTests {
                 startNodesInProcess = startNodesInProcess,
                 networkParameters = testNetworkParameters(
                         notaries = emptyList(),
-                        minimumPlatformVersion = 4, whitelistedContractImplementations = whitelistedAttachmentHashes
-                ), systemProperties = systemProperties
+                        minimumPlatformVersion = minimumPlatformVersion,
+                        whitelistedContractImplementations = whitelistedAttachmentHashes
+                ),
+                systemProperties = systemProperties
         ) {
             // create transaction using first Cordapp
             val (nodeName, baseDirectory, issuanceTransaction) = createIssuanceTransaction(cordapp)
