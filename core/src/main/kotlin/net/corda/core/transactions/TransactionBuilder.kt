@@ -430,7 +430,7 @@ open class TransactionBuilder(
             inputStates: List<TransactionState<ContractState>>?,
             attachmentToUse: ContractAttachment,
             services: ServicesForResolution): AttachmentConstraint = when {
-        inputStates != null -> attachmentConstraintsTransition(inputStates.groupBy { it.constraint }.keys, attachmentToUse)
+        inputStates != null -> attachmentConstraintsTransition(inputStates.groupBy { it.constraint }.keys, attachmentToUse, services)
         attachmentToUse.signerKeys.isNotEmpty() && services.networkParameters.minimumPlatformVersion < 4 -> {
             log.warnOnce("Signature constraints not available on network requiring a minimum platform version of 4. Current is: ${services.networkParameters.minimumPlatformVersion}.")
             if (useWhitelistedByZoneAttachmentConstraint(contractClassName, services.networkParameters)) {
@@ -455,7 +455,8 @@ open class TransactionBuilder(
      */
     private fun attachmentConstraintsTransition(
         constraints: Set<AttachmentConstraint>,
-        attachmentToUse: ContractAttachment
+        attachmentToUse: ContractAttachment,
+        services: ServicesForResolution
     ): AttachmentConstraint = when {
 
         // Sanity check.
@@ -473,7 +474,7 @@ open class TransactionBuilder(
         constraints.any { it is HashAttachmentConstraint } -> {
             when {
                 // Migration from a Hash Constraint to a Signature Constraint
-                attachmentToUse.isSigned -> {
+                attachmentToUse.isSigned && services.networkParameters.minimumPlatformVersion >= 4 -> {
                     val signatureConstraint = constraints.singleOrNull { it is SignatureAttachmentConstraint }
                     // If there were states transitioned already used in the current transaction use that signature constraint, otherwise create a new one.
                     when {
@@ -490,7 +491,7 @@ open class TransactionBuilder(
             throw IllegalArgumentException("Cannot mix SignatureAttachmentConstraints signed by different parties in the same transaction.")
 
         // This ensures a smooth migration from a Whitelist Constraint to a Signature Constraint
-        constraints.any { it is WhitelistedByZoneAttachmentConstraint } && attachmentToUse.isSigned -> {
+        constraints.any { it is WhitelistedByZoneAttachmentConstraint } && attachmentToUse.isSigned && services.networkParameters.minimumPlatformVersion >= 4-> {
             val signatureConstraint = constraints.singleOrNull { it is SignatureAttachmentConstraint }
             // If there were states transitioned already used in the current transaction use that signature constraint, otherwise create a new one.
             when {
