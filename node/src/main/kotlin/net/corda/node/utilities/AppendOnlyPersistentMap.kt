@@ -40,7 +40,7 @@ abstract class AppendOnlyPersistentMapBase<K, V, E, out EK>(
         return cache.get(key)!!.orElse(null)
     }
 
-    val size get() = allPersisted().toList().size
+    val size get() = allPersisted().count()
 
     /**
      * Returns all key/value pairs from the underlying storage.

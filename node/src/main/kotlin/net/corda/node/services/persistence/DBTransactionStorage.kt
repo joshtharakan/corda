@@ -14,7 +14,7 @@ import net.corda.core.serialization.internal.effectiveSerializationEnv
 import net.corda.core.toFuture
 import net.corda.core.transactions.CoreTransaction
 import net.corda.core.transactions.SignedTransaction
-import net.corda.node.services.api.WritableTransactionStorage
+import net.corda.core.internal.WritableTransactionStorage
 import net.corda.node.services.statemachine.FlowStateMachineImpl
 import net.corda.node.utilities.AppendOnlyPersistentMapBase
 import net.corda.node.utilities.WeightBasedAppendOnlyPersistentMap
@@ -48,6 +48,18 @@ class DBTransactionStorage(private val database: CordaPersistence, cacheFactory:
             @Lob
             @Column(name = "transaction_value", nullable = false)
             var transaction: ByteArray = EMPTY_BYTE_ARRAY
+    )
+
+    @Entity
+    @Table(name = "${NODE_DATABASE_PREFIX}unresolved_transactions")
+    class DBUnresolvedTransactions(
+            @Id
+            @Column(name = "tx_id", length = 64, nullable = false)
+            val txId: String,
+
+            @Lob
+            @Column(name = "transaction_value", nullable = false)
+            val transaction: ByteArray
     )
 
     private companion object {
@@ -88,10 +100,7 @@ class DBTransactionStorage(private val database: CordaPersistence, cacheFactory:
         private const val transactionSignatureOverheadEstimate = 1024
 
         private fun weighTx(tx: AppendOnlyPersistentMapBase.Transactional<TxCacheValue>): Int {
-            val actTx = tx.peekableValue
-            if (actTx == null) {
-                return 0
-            }
+            val actTx = tx.peekableValue ?: return 0
             return actTx.second.sumBy { it.size + transactionSignatureOverheadEstimate } + actTx.first.size
         }
     }
